@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    image: event-alignment-api:latest
+    container_name: event-alignment-api
+    ports:
+      - "8000:8000"
+    environment:
+      ALIGNMENT_DB_PATH: /data/alignment.db
+    volumes:
+      - alignment-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2); assert json.load(r)['status']=='ok'"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  alignment-data:
