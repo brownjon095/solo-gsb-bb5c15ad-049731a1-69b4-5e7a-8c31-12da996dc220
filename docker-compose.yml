@@ -4,7 +4,10 @@ services:
     image: event-alignment-api:latest
     container_name: event-alignment-api
     ports:
-      - "8000:8000"
+      # Bind to loopback by default; override with
+      # ALIGNMENT_PORT when bringing the stack up, e.g.
+      #   ALIGNMENT_PORT=8080 docker compose up -d
+      - "127.0.0.1:${ALIGNMENT_PORT:-8000}:8000"
     environment:
       ALIGNMENT_DB_PATH: /data/alignment.db
     volumes:

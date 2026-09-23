@@ -6,7 +6,7 @@ import itertools
 import random
 import unittest
 
-from app.alignment import align_events
+from app.alignment import ConstraintSearchLimit, align_events
 
 
 def _ids(prefix: str, n: int) -> list[str]:
@@ -260,6 +260,269 @@ class AlignmentTests(unittest.TestCase):
     def test_negative_tolerance_rejected(self):
         with self.assertRaises(ValueError):
             align_events(["a"], [0], ["b"], [0], -1)
+
+
+def _constrained_brute_force(l_times, r_times, l_src, r_src, tol, caps):
+    """Reference optimum under per-source-combo caps.
+
+    Returns the optimal matching as frozenset of canonical (i, j) with
+    ids "a{i}"/"b{j}" (inputs are already in ID order), matching the
+    same (cardinality, total diff, base-B vector) lexicographic rule.
+    """
+    nl, nr = len(l_times), len(r_times)
+    base = nr + 1
+    edges = [
+        (i, j)
+        for i in range(nl)
+        for j in range(nr)
+        if abs(l_times[i] - r_times[j]) <= tol
+    ]
+    best = None
+
+    def consider(matching):
+        nonlocal best
+        left_seen, right_seen = set(), set()
+        combo_used: dict = {}
+        total = 0
+        vector = [nr] * nl
+        for i, j in matching:
+            if i in left_seen or j in right_seen:
+                return
+            c = (l_src[i], r_src[j])
+            if c in caps and combo_used.get(c, 0) >= caps[c]:
+                return
+            combo_used[c] = combo_used.get(c, 0) + 1
+            left_seen.add(i)
+            right_seen.add(j)
+            total += abs(l_times[i] - r_times[j])
+            vector[i] = j
+        tie = 0
+        for digit in vector:
+            tie = tie * base + digit
+        score = (-len(matching), total, tie)
+        if best is None or score < best[0]:
+            best = (score, frozenset(matching))
+
+    for size in range(0, min(nl, nr) + 1):
+        for choice in itertools.combinations(edges, size):
+            consider(choice)
+    assert best is not None
+    return best[1]
+
+
+class SourceCapacityTests(unittest.TestCase):
+    def _run(self, l, r, tol, caps, sources=None):
+        """l/r are (id, t[, src]) tuples."""
+        l_ids = [x[0] for x in l]
+        l_times = [x[1] for x in l]
+        r_ids = [x[0] for x in r]
+        r_times = [x[1] for x in r]
+        l_src = [x[2] if len(x) > 2 else "L" for x in l]
+        r_src = [x[2] if len(x) > 2 else "R" for x in r]
+        return align_events(
+            l_ids, l_times, r_ids, r_times, tol, l_src, r_src,
+            source_capacities=caps,
+        )
+
+    def test_capacity_one_forces_global_rematch(self):
+        # Both left events share source L; both right events source R;
+        # cap (L,R)=1. Without a cap both pairs form; with it exactly one
+        # survives, and it must be the smaller-ID/total-diff optimum.
+        res = self._run(
+            [("a0", 0, "L"), ("a1", 100, "L")],
+            [("b0", 0, "R"), ("b1", 100, "R")],
+            200,
+            [("L", "R", 1)],
+        )
+        self.assertEqual(len(res.pairs), 1)
+        self.assertEqual(
+            {(p.left_id, p.right_id) for p in res.pairs},
+            {("a0", "b0")},
+        )
+        self.assertEqual(res.unmatched_left, ["a1"])
+        self.assertEqual(res.unmatched_right, ["b1"])
+
+    def test_zero_capacity_forbids_combination(self):
+        # Four same-time events, one diagonal per combination. Banning
+        # (L1,R1) forces the cross pairing (L1,R2)+(L2,R1).
+        res = self._run(
+            [("a0", 0, "L1"), ("a1", 0, "L2")],
+            [("b0", 0, "R1"), ("b1", 0, "R2")],
+            0,
+            [("L1", "R1", 0)],
+        )
+        self.assertEqual(
+            {(p.left_id, p.right_id) for p in res.pairs},
+            {("a0", "b1"), ("a1", "b0")},
+        )
+        self.assertEqual(res.unmatched_left, [])
+        self.assertEqual(res.unmatched_right, [])
+
+    def test_zero_capacity_can_block_all_pairs_of_a_source(self):
+        res = self._run(
+            [("a0", 0, "L")],
+            [("b0", 0, "R")],
+            0,
+            [("L", "R", 0)],
+        )
+        self.assertEqual(res.pairs, [])
+        self.assertEqual(res.unmatched_left, ["a0"])
+        self.assertEqual(res.unmatched_right, ["b0"])
+        stat = res.source_combos[0]
+        self.assertEqual(stat.capacity, 0)
+        self.assertEqual(stat.matched_pairs, 0)
+        self.assertEqual(stat.rejected_by_capacity, 1)
+
+    def test_undeclared_combination_stays_unlimited(self):
+        res = self._run(
+            [("a0", 0, "L"), ("a1", 0, "L")],
+            [("b0", 0, "R"), ("b1", 0, "Q")],
+            0,
+            [("L", "R", 0)],
+        )
+        # Only (L,R) is banned; (L,Q) is undeclared and unlimited. Both
+        # left events can only reach b1, so the smaller left ID wins.
+        self.assertEqual(
+            {(p.left_id, p.right_id) for p in res.pairs},
+            {("a0", "b1")},
+        )
+        self.assertEqual(res.unmatched_left, ["a1"])
+        self.assertEqual(res.unmatched_right, ["b0"])
+
+    def test_combo_summary_fields(self):
+        res = self._run(
+            [("a0", 0, "L"), ("a1", 100, "L")],
+            [("b0", 0, "R"), ("b1", 100, "R")],
+            200,
+            [("L", "R", 1)],
+        )
+        self.assertEqual(len(res.source_combos), 1)
+        stat = res.source_combos[0]
+        self.assertEqual(stat.left_source, "L")
+        self.assertEqual(stat.right_source, "R")
+        self.assertEqual(stat.capacity, 1)
+        self.assertEqual(stat.candidate_edges, 4)
+        self.assertEqual(stat.matched_pairs, 1)
+        self.assertEqual(stat.rejected_by_capacity, 1)
+        self.assertEqual(sum(s.matched_pairs for s in res.source_combos), 1)
+
+    def test_no_binding_capacity_zero_rejected_and_full_match(self):
+        res = self._run(
+            [("a0", 0, "L")],
+            [("b0", 0, "R")],
+            0,
+            [("L", "R", 5)],
+        )
+        self.assertEqual(len(res.pairs), 1)
+        self.assertEqual(res.source_combos[0].rejected_by_capacity, 0)
+        self.assertEqual(res.source_combos[0].matched_pairs, 1)
+
+    def test_capacity_prefers_smaller_diff_before_id(self):
+        # Two independent pairs exist (unconstrained optimum = both, 2
+        # pairs), but the single combo is capped at 1. Layer 2 keeps the
+        # tighter edge (a1/b1, 50 us) even though a0 has the smaller ID;
+        # the stable-ID tie-break only decides on equal diffs.
+        res = self._run(
+            [("a0", 0, "L"), ("a1", 1050, "L")],
+            [("b0", 100, "R"), ("b1", 1000, "R")],
+            100,
+            [("L", "R", 1)],
+        )
+        self.assertEqual(
+            {(p.left_id, p.right_id) for p in res.pairs},
+            {("a1", "b1")},
+        )
+        self.assertEqual(res.total_abs_diff_us, 50)
+        self.assertEqual(res.source_combos[0].rejected_by_capacity, 1)
+        self.assertEqual(res.unmatched_left, ["a0"])
+        self.assertEqual(res.unmatched_right, ["b0"])
+
+    def test_capacity_holds_tie_break_rule(self):
+        # cap 1 over the only combo; three rows tie on diff for one
+        # column and two others are forced out -- smallest left IDs win.
+        res = self._run(
+            [("a2", 0, "L"), ("a0", 0, "L"), ("a1", 0, "L")],
+            [("b0", 0, "R")],
+            0,
+            [("L", "R", 1)],
+        )
+        self.assertEqual(
+            {(p.left_id, p.right_id) for p in res.pairs}, {("a0", "b0")}
+        )
+
+    def test_duplicate_capacity_declaration_rejected(self):
+        with self.assertRaises(ValueError):
+            self._run(
+                [("a0", 0, "L")],
+                [("b0", 0, "R")],
+                0,
+                [("L", "R", 1), ("L", "R", 2)],
+            )
+
+    def test_negative_capacity_rejected(self):
+        with self.assertRaises(ValueError):
+            self._run(
+                [("a0", 0, "L")],
+                [("b0", 0, "R")],
+                0,
+                [("L", "R", -1)],
+            )
+
+    def test_capacity_does_not_change_request_without_capacities(self):
+        # Old-style call (no sources, no capacities) still works and
+        # reports combos against the empty source names.
+        res = align_events(["a0", "a1"], [0, 100], ["b0", "b1"], [0, 100], 200)
+        self.assertEqual(len(res.pairs), 2)
+        self.assertEqual(len(res.source_combos), 1)
+        self.assertIsNone(res.source_combos[0].capacity)
+        self.assertEqual(res.source_combos[0].matched_pairs, 2)
+
+    def test_too_many_candidate_edges_with_capacity_rejected(self):
+        # Dense 9x9 = 81 candidate edges > the 60-edge exact-search gate.
+        ids_l = [f"a{i}" for i in range(9)]
+        ids_r = [f"b{j}" for j in range(9)]
+        with self.assertRaises(ConstraintSearchLimit):
+            align_events(
+                ids_l, [0] * 9, ids_r, [0] * 9, 10**9,
+                ["L"] * 9, ["R"] * 9,
+                source_capacities=[("L", "R", 1)],
+            )
+
+    def test_randomised_constrained_against_brute_force(self):
+        rng = random.Random(20260923)
+        checked = 0
+        for _ in range(300):
+            nl = rng.randint(1, 4)
+            nr = rng.randint(1, 4)
+            l_times = [rng.randint(0, 300) for _ in range(nl)]
+            r_times = [rng.randint(0, 300) for _ in range(nr)]
+            l_src = [rng.choice(["L1", "L2", "L3"]) for _ in range(nl)]
+            r_src = [rng.choice(["R1", "R2", "R3"]) for _ in range(nr)]
+            tol = rng.choice([0, 50, 100, 300])
+            combos = sorted(
+                {(l_src[i], r_src[j])
+                 for i in range(nl) for j in range(nr)
+                 if abs(l_times[i] - r_times[j]) <= tol}
+            )
+            caps = [(a, b, rng.choice([0, 1, 2])) for a, b in combos]
+            caps = [c for c in caps if rng.random() < 0.65]
+
+            res = align_events(
+                [f"a{i}" for i in range(nl)], l_times,
+                [f"b{j}" for j in range(nr)], r_times,
+                tol, l_src, r_src, caps or None,
+            )
+            expected = _constrained_brute_force(
+                l_times, r_times, l_src, r_src, tol,
+                {(a, b): k for a, b, k in caps},
+            )
+            got = {
+                (int(p.left_id[1:]), int(p.right_id[1:]))
+                for p in res.pairs
+            }
+            self.assertEqual(got, expected, (l_times, r_times, caps, got))
+            checked += 1
+        self.assertGreater(checked, 200)
 
 
 if __name__ == "__main__":

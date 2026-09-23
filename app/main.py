@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
-from .alignment import AlignmentResult, align_events
+from .alignment import AlignmentResult, ConstraintSearchLimit, align_events
 from .db import get_conn, init_db
 from .schemas import (
     AlignmentRequest,
@@ -23,6 +23,7 @@ from .schemas import (
     JobListItem,
     JobListResponse,
     MatchedPairOut,
+    SourceComboOut,
     to_timestamp_us,
 )
 
@@ -39,9 +40,11 @@ app = FastAPI(
         "Submit two groups of timestamped events; the service builds "
         "candidate edges inside a tolerance window and produces a "
         "minimum-total-difference, one-to-one matching with stable "
-        "event-ID tie-breaks, keeping every unmatched event."
+        "event-ID tie-breaks, keeping every unmatched event. Optional "
+        "per-source-combination capacity caps are honoured by the global "
+        "optimum."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -116,6 +119,24 @@ def _build_response(conn: sqlite3.Connection, job_id: str) -> AlignmentResponse:
         "right": [e for e in right if e.id not in matched_right],
     }
 
+    combo_rows = conn.execute(
+        "SELECT left_source, right_source, capacity, candidate_edges, "
+        "matched_pairs, rejected_by_capacity FROM source_combo_stats "
+        "WHERE job_id = ? ORDER BY combo_ord",
+        (job_id,),
+    ).fetchall()
+    source_combos = [
+        SourceComboOut(
+            left_source=r["left_source"],
+            right_source=r["right_source"],
+            capacity=r["capacity"],
+            candidate_edges=r["candidate_edges"],
+            matched_pairs=r["matched_pairs"],
+            rejected_by_capacity=r["rejected_by_capacity"],
+        )
+        for r in combo_rows
+    ]
+
     return AlignmentResponse(
         job_id=job_id,
         tolerance_us=job["tolerance_us"],
@@ -129,6 +150,7 @@ def _build_response(conn: sqlite3.Connection, job_id: str) -> AlignmentResponse:
             unmatched_left=len(unmatched["left"]),
             unmatched_right=len(unmatched["right"]),
             total_abs_diff_us=job["total_abs_diff"],
+            source_combos=source_combos,
         ),
     )
 
@@ -139,13 +161,30 @@ def create_alignment(
     req: AlignmentRequest,
     conn: sqlite3.Connection = Depends(_get_db),
 ) -> Any:
-    result: AlignmentResult = align_events(
-        left_ids=[e.id for e in req.left],
-        left_times=[to_timestamp_us(e.timestamp) for e in req.left],
-        right_ids=[e.id for e in req.right],
-        right_times=[to_timestamp_us(e.timestamp) for e in req.right],
-        tolerance_us=req.tolerance_us,
-    )
+    try:
+        result: AlignmentResult = align_events(
+            left_ids=[e.id for e in req.left],
+            left_times=[to_timestamp_us(e.timestamp) for e in req.left],
+            right_ids=[e.id for e in req.right],
+            right_times=[to_timestamp_us(e.timestamp) for e in req.right],
+            tolerance_us=req.tolerance_us,
+            left_sources=[e.source_key for e in req.left],
+            right_sources=[e.source_key for e in req.right],
+            source_capacities=[
+                (c.left_source, c.right_source, c.max_matches)
+                for c in (req.source_capacities or [])
+            ] or None,
+        )
+    except ConstraintSearchLimit as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{exc}. Capacity-constrained alignment is exact but "
+                "NP-hard at scale, so at most 60 candidate edges are "
+                "accepted per request; narrow tolerance_us or split the "
+                "request into smaller/source-homogeneous groups."
+            ),
+        ) from exc
 
     job_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
@@ -195,6 +234,33 @@ def create_alignment(
         [
             (job_id, ord_, p.left_id, p.right_id, p.diff_us, p.abs_diff_us)
             for ord_, p in enumerate(result.pairs)
+        ],
+    )
+    if req.source_capacities:
+        conn.executemany(
+            "INSERT INTO source_capacities (job_id, left_source, right_source, "
+            "max_matches) VALUES (?, ?, ?, ?)",
+            [
+                (job_id, c.left_source, c.right_source, c.max_matches)
+                for c in req.source_capacities
+            ],
+        )
+    conn.executemany(
+        "INSERT INTO source_combo_stats (job_id, combo_ord, left_source, "
+        "right_source, capacity, candidate_edges, matched_pairs, "
+        "rejected_by_capacity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                job_id,
+                ord_,
+                c.left_source,
+                c.right_source,
+                c.capacity,
+                c.candidate_edges,
+                c.matched_pairs,
+                c.rejected_by_capacity,
+            )
+            for ord_, c in enumerate(result.source_combos)
         ],
     )
 

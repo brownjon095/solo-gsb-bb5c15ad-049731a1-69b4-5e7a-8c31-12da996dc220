@@ -59,6 +59,29 @@ class EventIn(BaseModel):
         return to_utc_iso(v)
 
 
+class SourceCapacity(BaseModel):
+    """Per-combination match cap for one ``(left source, right source)`` pair."""
+
+    left_source: str = Field(
+        ...,
+        min_length=1,
+        description="source_key of events on the left (A) side",
+    )
+    right_source: str = Field(
+        ...,
+        min_length=1,
+        description="source_key of events on the right (B) side",
+    )
+    max_matches: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "At most this many matched pairs may join the two sources; "
+            "0 forbids the combination entirely"
+        ),
+    )
+
+
 class AlignmentRequest(BaseModel):
     """Two groups of events to align against each other."""
 
@@ -69,15 +92,37 @@ class AlignmentRequest(BaseModel):
     )
     left: list[EventIn] = Field(..., min_length=1)
     right: list[EventIn] = Field(..., min_length=1)
+    source_capacities: list[SourceCapacity] | None = Field(
+        default=None,
+        description=(
+            "Optional caps per (left source_key, right source_key) "
+            "combination. Combinations not listed are unlimited. The "
+            "maximum-cardinality / minimum-total-difference / stable-ID "
+            "optimum is computed *subject to* every cap."
+        ),
+    )
 
     @model_validator(mode="after")
-    def _unique_ids(self) -> "AlignmentRequest":
+    def _unique_ids_and_capacities(self) -> "AlignmentRequest":
         for side_name, events in (("left", self.left), ("right", self.right)):
             ids = [e.id for e in events]
             dupes = {x for x in ids if ids.count(x) > 1}
             if dupes:
                 raise ValueError(
                     f"duplicate event id(s) on {side_name}: {sorted(dupes)}"
+                )
+        if self.source_capacities:
+            seen: set[tuple[str, str]] = set()
+            dupes: set[tuple[str, str]] = set()
+            for c in self.source_capacities:
+                key = (c.left_source, c.right_source)
+                if key in seen:
+                    dupes.add(key)
+                seen.add(key)
+            if dupes:
+                raise ValueError(
+                    "duplicate capacity declaration(s) for source "
+                    f"combination(s): {sorted(dupes)}"
                 )
         return self
 
@@ -99,12 +144,36 @@ class EventOut(BaseModel):
     payload_summary: str = ""
 
 
+class SourceComboOut(BaseModel):
+    left_source: str
+    right_source: str
+    capacity: int | None = Field(
+        ...,
+        description="Declared per-combination cap, or null when undeclared (unlimited)",
+    )
+    candidate_edges: int = Field(
+        ..., description="Candidate edges inside the tolerance window for this combination"
+    )
+    matched_pairs: int = Field(..., description="Pairs actually matched for this combination")
+    rejected_by_capacity: int = Field(
+        ...,
+        description=(
+            "Edges of the unconstrained optimum dropped solely because the "
+            "combination reached its cap; 0 for undeclared combinations"
+        ),
+    )
+
+
 class AlignmentSummary(BaseModel):
     candidate_edges: int
     matched_pairs: int
     unmatched_left: int
     unmatched_right: int
     total_abs_diff_us: int
+    source_combos: list[SourceComboOut] = Field(
+        default_factory=list,
+        description="Per source-key combination: capacity, actual matches, capacity-rejected edges",
+    )
 
 
 class AlignmentResponse(BaseModel):

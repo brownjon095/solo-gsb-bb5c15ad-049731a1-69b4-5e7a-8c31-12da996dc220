@@ -39,6 +39,26 @@ CREATE TABLE IF NOT EXISTS pairs (
     PRIMARY KEY (job_id, pair_ord)
 );
 
+CREATE TABLE IF NOT EXISTS source_capacities (
+    job_id       TEXT NOT NULL REFERENCES jobs(job_id),
+    left_source  TEXT NOT NULL,
+    right_source TEXT NOT NULL,
+    max_matches  INTEGER NOT NULL,
+    PRIMARY KEY (job_id, left_source, right_source)
+);
+
+CREATE TABLE IF NOT EXISTS source_combo_stats (
+    job_id                 TEXT NOT NULL REFERENCES jobs(job_id),
+    combo_ord              INTEGER NOT NULL,
+    left_source            TEXT NOT NULL,
+    right_source           TEXT NOT NULL,
+    capacity               INTEGER,
+    candidate_edges        INTEGER NOT NULL,
+    matched_pairs          INTEGER NOT NULL,
+    rejected_by_capacity   INTEGER NOT NULL,
+    PRIMARY KEY (job_id, combo_ord)
+);
+
 CREATE INDEX IF NOT EXISTS idx_pairs_job ON pairs(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, side);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
