@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
-from .alignment import AlignmentResult, align_events
+from .alignment import AlignmentResult, align_events, source_pair_stats
 from .db import get_conn, init_db
 from .schemas import (
     AlignmentRequest,
@@ -23,6 +23,7 @@ from .schemas import (
     JobListItem,
     JobListResponse,
     MatchedPairOut,
+    SourcePairStatOut,
     to_timestamp_us,
 )
 
@@ -39,9 +40,12 @@ app = FastAPI(
         "Submit two groups of timestamped events; the service builds "
         "candidate edges inside a tolerance window and produces a "
         "minimum-total-difference, one-to-one matching with stable "
-        "event-ID tie-breaks, keeping every unmatched event."
+        "event-ID tie-breaks, keeping every unmatched event. Requests may "
+        "optionally cap the number of matched pairs per "
+        "(left source_key, right source_key) combination; the optimum is "
+        "then computed exactly under those capacity constraints."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -72,24 +76,34 @@ def _build_response(conn: sqlite3.Connection, job_id: str) -> AlignmentResponse:
     if job is None:
         raise HTTPException(status_code=404, detail=f"job '{job_id}' not found")
 
-    def fetch_events(side: str) -> list[EventOut]:
-        rows = conn.execute(
-            "SELECT event_id, timestamp_iso, source_key, payload_summary "
-            "FROM events WHERE job_id = ? AND side = ? ORDER BY event_id",
+    def fetch_events(side: str) -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT event_id, timestamp_iso, timestamp_us, source_key, "
+            "payload_summary FROM events WHERE job_id = ? AND side = ? "
+            "ORDER BY event_id",
             (job_id, side),
         ).fetchall()
-        return [
-            EventOut(
-                id=r["event_id"],
-                timestamp=r["timestamp_iso"],
-                source_key=r["source_key"],
-                payload_summary=r["payload_summary"],
-            )
-            for r in rows
-        ]
 
-    left = fetch_events("left")
-    right = fetch_events("right")
+    left_rows = fetch_events("left")
+    right_rows = fetch_events("right")
+    left = [
+        EventOut(
+            id=r["event_id"],
+            timestamp=r["timestamp_iso"],
+            source_key=r["source_key"],
+            payload_summary=r["payload_summary"],
+        )
+        for r in left_rows
+    ]
+    right = [
+        EventOut(
+            id=r["event_id"],
+            timestamp=r["timestamp_iso"],
+            source_key=r["source_key"],
+            payload_summary=r["payload_summary"],
+        )
+        for r in right_rows
+    ]
 
     pair_rows = conn.execute(
         "SELECT left_id, right_id, diff_us, abs_diff_us "
@@ -108,6 +122,27 @@ def _build_response(conn: sqlite3.Connection, job_id: str) -> AlignmentResponse:
         )
         for r in pair_rows
     ]
+
+    capacity_rows = conn.execute(
+        "SELECT left_source_key, right_source_key, max_pairs "
+        "FROM job_capacities WHERE job_id = ?",
+        (job_id,),
+    ).fetchall()
+    capacities = {
+        (r["left_source_key"], r["right_source_key"]): r["max_pairs"]
+        for r in capacity_rows
+    }
+    stats = source_pair_stats(
+        left_ids=[r["event_id"] for r in left_rows],
+        left_times=[r["timestamp_us"] for r in left_rows],
+        left_sources=[r["source_key"] for r in left_rows],
+        right_ids=[r["event_id"] for r in right_rows],
+        right_times=[r["timestamp_us"] for r in right_rows],
+        right_sources=[r["source_key"] for r in right_rows],
+        tolerance_us=job["tolerance_us"],
+        pairs=[(r["left_id"], r["right_id"]) for r in pair_rows],
+        capacities=capacities,
+    )
 
     matched_left = {p.left_id for p in pairs}
     matched_right = {p.right_id for p in pairs}
@@ -129,6 +164,18 @@ def _build_response(conn: sqlite3.Connection, job_id: str) -> AlignmentResponse:
             unmatched_left=len(unmatched["left"]),
             unmatched_right=len(unmatched["right"]),
             total_abs_diff_us=job["total_abs_diff"],
+            capacity_rejected_edges=sum(s.rejected_edges for s in stats),
+            source_pairs=[
+                SourcePairStatOut(
+                    left_source_key=s.left_source_key,
+                    right_source_key=s.right_source_key,
+                    capacity=s.capacity,
+                    candidate_edges=s.candidate_edges,
+                    matched_pairs=s.matched_pairs,
+                    rejected_edges=s.rejected_edges,
+                )
+                for s in stats
+            ],
         ),
     )
 
@@ -139,12 +186,19 @@ def create_alignment(
     req: AlignmentRequest,
     conn: sqlite3.Connection = Depends(_get_db),
 ) -> Any:
+    capacities = {
+        (c.left_source_key, c.right_source_key): c.max_pairs
+        for c in req.source_pair_capacities
+    }
     result: AlignmentResult = align_events(
         left_ids=[e.id for e in req.left],
         left_times=[to_timestamp_us(e.timestamp) for e in req.left],
         right_ids=[e.id for e in req.right],
         right_times=[to_timestamp_us(e.timestamp) for e in req.right],
         tolerance_us=req.tolerance_us,
+        left_sources=[e.source_key for e in req.left],
+        right_sources=[e.source_key for e in req.right],
+        capacities=capacities or None,
     )
 
     job_id = uuid.uuid4().hex
@@ -161,6 +215,15 @@ def create_alignment(
             result.candidate_edge_count,
         ),
     )
+    if capacities:
+        conn.executemany(
+            "INSERT INTO job_capacities (job_id, left_source_key, "
+            "right_source_key, max_pairs) VALUES (?, ?, ?, ?)",
+            [
+                (job_id, left_key, right_key, max_pairs)
+                for (left_key, right_key), max_pairs in sorted(capacities.items())
+            ],
+        )
     conn.executemany(
         "INSERT INTO events (job_id, side, event_id, timestamp_iso, "
         "timestamp_us, source_key, payload_summary) VALUES (?, ?, ?, ?, ?, ?, ?)",

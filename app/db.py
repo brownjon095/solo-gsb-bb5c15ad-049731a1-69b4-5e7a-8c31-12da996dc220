@@ -39,9 +39,18 @@ CREATE TABLE IF NOT EXISTS pairs (
     PRIMARY KEY (job_id, pair_ord)
 );
 
+CREATE TABLE IF NOT EXISTS job_capacities (
+    job_id           TEXT NOT NULL REFERENCES jobs(job_id),
+    left_source_key  TEXT NOT NULL,
+    right_source_key TEXT NOT NULL,
+    max_pairs        INTEGER NOT NULL,
+    PRIMARY KEY (job_id, left_source_key, right_source_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_pairs_job ON pairs(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, side);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_capacities_job ON job_capacities(job_id);
 """
 
 

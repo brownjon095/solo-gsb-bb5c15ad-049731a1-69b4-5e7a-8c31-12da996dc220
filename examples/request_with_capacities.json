@@ -1,0 +1,15 @@
+{
+  "tolerance_us": 200000,
+  "left": [
+    {"id": "cam-1", "timestamp": "2026-09-22T10:00:00Z", "source_key": "camera", "payload_summary": "person entered"},
+    {"id": "cam-2", "timestamp": "2026-09-22T10:00:00.100000Z", "source_key": "camera", "payload_summary": "person at door"},
+    {"id": "gate-a", "timestamp": "2026-09-22T10:00:00.050000Z", "source_key": "gate", "payload_summary": "gate opened"}
+  ],
+  "right": [
+    {"id": "rfid-1", "timestamp": "2026-09-22T10:00:00.000050Z", "source_key": "rfid", "payload_summary": "badge scan"},
+    {"id": "rfid-2", "timestamp": "2026-09-22T10:00:00.100050Z", "source_key": "rfid", "payload_summary": "badge scan"}
+  ],
+  "source_pair_capacities": [
+    {"left_source_key": "camera", "right_source_key": "rfid", "max_pairs": 1}
+  ]
+}

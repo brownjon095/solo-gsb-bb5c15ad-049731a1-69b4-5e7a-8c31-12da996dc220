@@ -1,6 +1,6 @@
 # 跨来源事件对齐 API（Cross-source Event Alignment）
 
-用 **FastAPI + SQLite** 构建的事件对齐服务：客户端提交两组带时间戳、来源键和载荷摘要的事件，服务在容差窗口内建立候选边，并给出**一对一、总时间差最小**的匹配；平局按事件 ID 稳定决胜；**所有未匹配事件都会保留**并单独列出。结果持久化在 SQLite 中，可用 Docker Compose 一键启动。
+用 **FastAPI + SQLite** 构建的事件对齐服务：客户端提交两组带时间戳、来源键和载荷摘要的事件，服务在容差窗口内建立候选边，并给出**一对一、总时间差最小**的匹配；平局按事件 ID 稳定决胜；**所有未匹配事件都会保留**并单独列出。可选的**来源配对容量约束**允许限制每个「left 来源 × right 来源」组合的最大匹配数，求解器在约束下仍求全局最优。结果持久化在 SQLite 中，可用 Docker Compose 一键启动。
 
 ## 匹配语义
 
@@ -12,14 +12,18 @@
    1. 匹配对数最多（最大基数）；
    2. 所有配对的绝对时间差之和最小；
    3. 若仍平局，按事件 ID 稳定决胜——两侧事件各自按 ID 排序，最小化「左侧第 i 个事件所配右侧事件的 ID 名次」的字典序（未配对比任何真实名次都大）。结果与客户端提交顺序无关。
-4. **未匹配事件保留**：无法配对的事件原样出现在响应的 `unmatched.left` / `unmatched.right` 中，绝不丢弃。
-5. **差值解释**：每对都返回
+4. **来源配对容量（可选）**：请求可声明某些 `(left source_key, right source_key)` 组合的最大匹配数；未声明的组合不限额。上述三层目标不变，只是在**满足容量约束的匹配集合**上取全局最优。
+5. **未匹配事件保留**：无法配对的事件原样出现在响应的 `unmatched.left` / `unmatched.right` 中，绝不丢弃。
+6. **差值解释**：每对都返回
    - `diff_us = t(left) − t(right)`（带符号，可判断谁先谁后）；
    - `abs_diff_us = |diff_us|`；
    - 人类可读的 `explanation`，例如
      `|t('cam-a') - t('rfid-1')| = 100000 us (diff = t(left) - t(right) = -100000 us; 'cam-a' is 100000 us earlier than 'rfid-1')`。
 
-求解器（`app/alignment.py`）把上述三层目标编码进一个精确整数的**最大权指派问题**，用匈牙利算法一次求出全局最优（纯标准库实现，无浮点误差）。
+求解器（`app/alignment.py`）把三层目标编码进一个精确整数的**最大权匹配**（纯标准库实现，无浮点误差）：
+
+- **无容量约束**（含所有旧请求）：编码为方阵上的最大权指派，用匈牙利算法一次求出全局最优。
+- **有容量约束**：容量约束下的匹配不再是纯指派问题（一般情形是 NP 难的），求解器分两步——先算无约束最优解，若它恰好满足全部容量即直接返回（权重编码保证最优解唯一，此时它就是约束最优）；否则用**精确分支定界**在同一权重编码下搜索，剪枝上界来自容量感知的最大流松弛（source → left 事件 → 组合节点 → right 事件 → sink）。分支定界保证全局最优，但最坏情形是指数级，请把带容量约束的任务规模控制在几十事件以内。
 
 ## 一键启动（Docker Compose）
 
@@ -47,6 +51,14 @@ docker compose down -v          # 停止并同时删除数据库卷
 ## 示例请求
 
 ### 1. 创建对齐任务
+
+```bash
+curl -X POST http://localhost:8000/alignments \
+  -H 'Content-Type: application/json' \
+  -d @examples/request.json
+```
+
+等价的内联写法：
 
 ```bash
 curl -X POST http://localhost:8000/alignments \
@@ -104,24 +116,92 @@ curl -X POST http://localhost:8000/alignments \
     "matched_pairs": 2,
     "unmatched_left": 0,
     "unmatched_right": 1,
-    "total_abs_diff_us": 150000
+    "total_abs_diff_us": 150000,
+    "capacity_rejected_edges": 0,
+    "source_pairs": [
+      {
+        "left_source_key": "camera-1",
+        "right_source_key": "rfid-gate",
+        "capacity": null,
+        "candidate_edges": 2,
+        "matched_pairs": 2,
+        "rejected_edges": 0
+      }
+    ]
   }
 }
 ```
 
-### 2. 按 ID 取回任务（持久化）
+### 2. 来源配对容量约束（可选）
+
+在请求中增加 `source_pair_capacities` 即可限制每个「left 来源 × right 来源」组合的最大匹配数：
+
+| 字段                | 类型   | 说明                                       |
+| ------------------- | ------ | ------------------------------------------ |
+| `left_source_key`   | string | left 事件的 `source_key`（非空）            |
+| `right_source_key`  | string | right 事件的 `source_key`（非空）           |
+| `max_pairs`         | int ≥ 0 | 该组合最多贡献的匹配对数（`0` = 禁止该组合） |
+
+语义要点：
+
+- 未声明的组合**不限额**；`source_pair_capacities` 省略或为空数组时行为与旧版本完全一致。
+- 同一 `(left_source_key, right_source_key)` 重复声明会返回 `422`。
+- 优化目标不变：仍在**满足容量**的匹配中求全局最优（匹配数最多 → 总时间差最小 → ID 稳定决胜）。
+- 容量随任务持久化（`job_capacities` 表），按 ID 取回时 summary 会重新算出同样的统计。
+
+示例（完整请求见 `examples/request_with_capacities.json`）：3 个 left 事件（2 个 `camera`、1 个 `gate`）、2 个 `rfid` right 事件，限制 `camera × rfid` 最多 1 对：
+
+```bash
+curl -X POST http://localhost:8000/alignments \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_with_capacities.json
+```
+
+响应（HTTP `201`，节选 `summary`）：无约束时两个 `camera` 事件都会配上 `rfid`，容量为 1 后全局最优变为 `cam-2↔rfid-2`（50 µs）+ `gate-a↔rfid-1`（49_950 µs）：
+
+```json
+{
+  "summary": {
+    "candidate_edges": 6,
+    "matched_pairs": 2,
+    "unmatched_left": 1,
+    "unmatched_right": 0,
+    "total_abs_diff_us": 50000,
+    "capacity_rejected_edges": 3,
+    "source_pairs": [
+      {"left_source_key": "camera", "right_source_key": "rfid", "capacity": 1,
+       "candidate_edges": 4, "matched_pairs": 1, "rejected_edges": 3},
+      {"left_source_key": "gate", "right_source_key": "rfid", "capacity": null,
+       "candidate_edges": 2, "matched_pairs": 1, "rejected_edges": 0}
+    ]
+  }
+}
+```
+
+`summary.source_pairs` 为每个「有候选边、有匹配、或声明了容量」的来源组合返回一项（按来源键排序）：
+
+| 字段              | 说明                                                                 |
+| ----------------- | -------------------------------------------------------------------- |
+| `capacity`        | 声明的最大匹配数；`null` 表示未声明（不限额）                          |
+| `candidate_edges` | 该组合内容差窗口内的候选边数                                          |
+| `matched_pairs`   | 该组合的实际匹配对数                                                  |
+| `rejected_edges`  | 因容量被拒的候选边数：`max(0, candidate_edges − capacity)`；不限额时为 0 |
+
+`summary.capacity_rejected_edges` 是所有组合 `rejected_edges` 的总和。
+
+### 3. 按 ID 取回任务（持久化）
 
 ```bash
 curl http://localhost:8000/alignments/b7c955eefbbd47f580fd0feef48cca20
 ```
 
-### 3. 列出最近的任务（最多 100 条，新的在前）
+### 4. 列出最近的任务（最多 100 条，新的在前）
 
 ```bash
 curl http://localhost:8000/jobs
 ```
 
-### 4. 健康检查
+### 5. 健康检查
 
 ```bash
 curl http://localhost:8000/health
@@ -138,7 +218,7 @@ curl http://localhost:8000/health
 | GET    | `/health`                | 存活探针                                  |
 | GET    | `/docs`、`/redoc`        | 自动生成的交互文档                        |
 
-校验失败（重复 ID、负容差、无法解析的时间戳等）返回 HTTP `422`，未知 `job_id` 返回 `404`。
+校验失败（重复 ID、负容差、无法解析的时间戳、重复/非法的容量声明等）返回 HTTP `422`，未知 `job_id` 返回 `404`。
 
 ## 不用 Docker 的本地运行方式
 
@@ -159,8 +239,8 @@ pip install -r requirements.txt httpx
 python -m unittest discover -s tests -v
 ```
 
-- `tests/test_alignment.py`：核心算法单测（仅标准库），含边界、矩形规模、ID 决胜、顺序无关性，以及 400 组随机用例对暴力枚举最优解的对照。
-- `tests/test_api.py`：基于 TestClient 的端到端测试（建任务、持久化、校验错误、平局决胜）。
+- `tests/test_alignment.py`：核心算法单测（仅标准库），含边界、矩形规模、ID 决胜、顺序无关性、容量约束语义与全局最优、来源组合统计，以及随机用例（无容量 400 组、带容量 300 组）对暴力枚举最优解的对照。
+- `tests/test_api.py`：基于 TestClient 的端到端测试（建任务、持久化、校验错误、平局决胜、容量约束端到端与 summary 统计）。
 
 ## 目录结构
 
@@ -168,10 +248,11 @@ python -m unittest discover -s tests -v
 .
 ├── app/
 │   ├── __init__.py
-│   ├── alignment.py     # 纯标准库：候选边 + 匈牙利全局最优 + ID 决胜
+│   ├── alignment.py     # 纯标准库：候选边 + 匈牙利/分支定界全局最优 + ID 决胜 + 来源组合统计
 │   ├── schemas.py       # Pydantic 请求/响应模型、ISO-8601 时间解析
-│   ├── db.py            # SQLite 连接、建表脚本
+│   ├── db.py            # SQLite 连接、建表脚本（jobs/events/pairs/job_capacities）
 │   └── main.py          # FastAPI 路由与结果组装
+├── examples/            # 可直接 curl 提交的示例请求（含容量约束示例）
 ├── tests/               # 单元测试与 API 集成测试
 ├── requirements.txt
 ├── Dockerfile

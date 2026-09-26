@@ -59,6 +59,20 @@ class EventIn(BaseModel):
         return to_utc_iso(v)
 
 
+class SourcePairCapacity(BaseModel):
+    """Max matched pairs allowed for one (left, right) source-key pair."""
+
+    left_source_key: str = Field(
+        ..., min_length=1, description="source_key of left events"
+    )
+    right_source_key: str = Field(
+        ..., min_length=1, description="source_key of right events"
+    )
+    max_pairs: int = Field(
+        ..., ge=0, description="Maximum matched pairs for this source pair"
+    )
+
+
 class AlignmentRequest(BaseModel):
     """Two groups of events to align against each other."""
 
@@ -69,6 +83,13 @@ class AlignmentRequest(BaseModel):
     )
     left: list[EventIn] = Field(..., min_length=1)
     right: list[EventIn] = Field(..., min_length=1)
+    source_pair_capacities: list[SourcePairCapacity] = Field(
+        default_factory=list,
+        description=(
+            "Optional per-(left source_key, right source_key) caps on the "
+            "number of matched pairs; combinations not listed are unlimited"
+        ),
+    )
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "AlignmentRequest":
@@ -79,6 +100,19 @@ class AlignmentRequest(BaseModel):
                 raise ValueError(
                     f"duplicate event id(s) on {side_name}: {sorted(dupes)}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _unique_capacity_pairs(self) -> "AlignmentRequest":
+        keys = [
+            (c.left_source_key, c.right_source_key)
+            for c in self.source_pair_capacities
+        ]
+        dupes = {k for k in keys if keys.count(k) > 1}
+        if dupes:
+            raise ValueError(
+                f"duplicate source-pair capacity entries: {sorted(dupes)}"
+            )
         return self
 
 
@@ -99,12 +133,40 @@ class EventOut(BaseModel):
     payload_summary: str = ""
 
 
+class SourcePairStatOut(BaseModel):
+    left_source_key: str
+    right_source_key: str
+    capacity: int | None = Field(
+        ..., description="Declared max pairs for this combination; null = unlimited"
+    )
+    candidate_edges: int = Field(
+        ..., description="Candidate edges between the two sources within tolerance"
+    )
+    matched_pairs: int = Field(
+        ..., description="Pairs actually matched in this combination"
+    )
+    rejected_edges: int = Field(
+        ...,
+        description=(
+            "Candidate edges denied by the capacity: "
+            "max(0, candidate_edges - capacity); 0 when unlimited"
+        ),
+    )
+
+
 class AlignmentSummary(BaseModel):
     candidate_edges: int
     matched_pairs: int
     unmatched_left: int
     unmatched_right: int
     total_abs_diff_us: int
+    capacity_rejected_edges: int = Field(
+        0, description="Total candidate edges rejected due to source-pair capacities"
+    )
+    source_pairs: list[SourcePairStatOut] = Field(
+        default_factory=list,
+        description="Per-(left source, right source) combination statistics",
+    )
 
 
 class AlignmentResponse(BaseModel):
